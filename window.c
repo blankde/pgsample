@@ -813,9 +813,11 @@ finalize_windowaggregate(WindowAggState *winstate,
  * data onto the same transition value.  This is not a behavior required by
  * nodeAgg.c.
  */
+
 static void
-eval_windowaggregates(WindowAggState *winstate)
+eval_windowaggregates_sample(WindowAggState *winstate)
 {
+
 	WindowStatePerAgg peraggstate;
 	int			wfuncno,
 				numaggs,
@@ -827,8 +829,6 @@ eval_windowaggregates(WindowAggState *winstate)
 	WindowObject agg_winobj;
 	TupleTableSlot *agg_row_slot;
 	TupleTableSlot *temp_slot;
-	bool		frame_head_moved_backwards;
-	bool		frame_tail_moved_backwards;
 
 	numaggs = winstate->numaggs;
 	if (numaggs == 0)
@@ -839,7 +839,7 @@ eval_windowaggregates(WindowAggState *winstate)
 	agg_winobj = winstate->agg_winobj;
 	agg_row_slot = winstate->agg_row_slot;
 	temp_slot = winstate->temp_slot_1;
-
+	srand(time(0));
 	/*
 	 * Currently, we support only a subset of the SQL-standard window framing
 	 * rules.
@@ -885,14 +885,11 @@ eval_windowaggregates(WindowAggState *winstate)
 	 *
 	 * The frame head should never move backwards, and the code below wouldn't
 	 * cope if it did, so for safety we complain if it does.
-	 *
-	 * GPDB: We accept it if the start offset is not a constant. PostgreSQL
-	 * only allows constant offsets, but we're more flexible. The code below
-	 * does actually cope with it just fine.
 	 */
+	winstate->preframetailpos = winstate->frametailpos;
 	update_frameheadpos(agg_winobj, temp_slot);
-	if (winstate->start_offset_var_free &&
-		winstate->frameheadpos < winstate->aggregatedbase)
+	update_frametailpos(agg_winobj, temp_slot);
+	if (winstate->frameheadpos < winstate->aggregatedbase)
 		elog(ERROR, "window frame head moved backward");
 
 	/*
@@ -910,9 +907,7 @@ eval_windowaggregates(WindowAggState *winstate)
 		(winstate->frameOptions & (FRAMEOPTION_END_UNBOUNDED_FOLLOWING |
 								   FRAMEOPTION_END_CURRENT_ROW)) &&
 		winstate->aggregatedbase <= winstate->currentpos &&
-		winstate->aggregatedupto > winstate->currentpos &&
-		winstate->start_offset_var_free &&
-		winstate->end_offset_var_free)
+		winstate->aggregatedupto > winstate->currentpos)
 	{
 		for (i = 0; i < numaggs; i++)
 		{
@@ -923,50 +918,6 @@ eval_windowaggregates(WindowAggState *winstate)
 		}
 		return;
 	}
-
-	/*
-	 * If the END offset contains a variable, then it's possible for the frame's
-	 * end to move backwards. If that happens, restart all aggregates. (Depending
-	 * on how much it moved, it might be faster to apply the inverse transition
-	 * function to "subtract" those rows, but let's keep this simple for now.)
-	 */
-	frame_tail_moved_backwards = false;
-	if (!winstate->end_offset_var_free && winstate->aggregatedupto > 0)
-	{
-		/* Fetch the last row of the previous frame */
-		if (!TupIsNull(agg_row_slot))
-			ExecClearTuple(agg_row_slot);
-		if (!window_gettupleslot(agg_winobj, winstate->aggregatedupto - 1,
-								 agg_row_slot))
-		{
-			/* must be end of partition */
-			/* XXX: I don't think this should ever happen. */
-			frame_tail_moved_backwards = true;
-		}
-		/*
-		 * Is the last row of the previous frame still in current frame?
-		 * If not, then the end of the frame must've moved backwards.
-		 * (Or it moved so much forward that there is no overlap between
-		 * the old and the new frame. In that case, we would restart
-		 * all the aggregates anyway.)
-		 */
-		else if (!row_is_in_frame(winstate, winstate->aggregatedupto - 1, agg_row_slot))
-		{
-			frame_tail_moved_backwards = true;
-		}
-
-		ExecClearTuple(agg_row_slot);
-	}
-
-	/*
-	 * Likewise, if the frame tail moves backwards, then we need to restart the
-	 * aggregation. (We could instead call the transition function on the rows
-	 * that became part of the frame again, but let's keep this simple for now.)
-	 */
-	if (winstate->frameheadpos < winstate->aggregatedbase)
-		frame_head_moved_backwards = true;
-	else
-		frame_head_moved_backwards = false;
 
 	/*----------
 	 * Initialize restart flags.
@@ -989,9 +940,7 @@ eval_windowaggregates(WindowAggState *winstate)
 		if (winstate->currentpos == 0 ||
 			(winstate->aggregatedbase != winstate->frameheadpos &&
 			 !OidIsValid(peraggstate->invtransfn_oid)) ||
-			winstate->aggregatedupto <= winstate->frameheadpos ||
-			frame_head_moved_backwards ||
-			frame_tail_moved_backwards)
+			winstate->aggregatedupto <= winstate->frameheadpos)
 		{
 			peraggstate->restart = true;
 			numaggs_restart++;
@@ -1072,7 +1021,7 @@ eval_windowaggregates(WindowAggState *winstate)
 	 *
 	 * We assume that aggregates using the shared context always restart if
 	 * *any* aggregate restarts, and we may thus clean up the shared
-	 * aggcontext if that is the case.	Private aggcontexts are reset by
+	 * aggcontext if that is the case.  Private aggcontexts are reset by
 	 * initialize_windowaggregate() if their owning aggregate restarts. If we
 	 * aren't restarting an aggregate, we need to free any previously saved
 	 * result for it, else we'll leak memory.
@@ -1109,9 +1058,9 @@ eval_windowaggregates(WindowAggState *winstate)
 	 * (i.e., frameheadpos) and aggregatedupto, while restarted aggregates
 	 * contain no rows.  If there are any restarted aggregates, we must thus
 	 * begin aggregating anew at frameheadpos, otherwise we may simply
-	 * continue at aggregatedupto.	We must remember the old value of
+	 * continue at aggregatedupto.  We must remember the old value of
 	 * aggregatedupto to know how long to skip advancing non-restarted
-	 * aggregates.	If we modify aggregatedupto, we must also clear
+	 * aggregates.  If we modify aggregatedupto, we must also clear
 	 * agg_row_slot, per the loop invariant below.
 	 */
 	aggregatedupto_nonrestarted = winstate->aggregatedupto;
@@ -1126,58 +1075,194 @@ eval_windowaggregates(WindowAggState *winstate)
 	 * Advance until we reach a row not in frame (or end of partition).
 	 *
 	 * Note the loop invariant: agg_row_slot is either empty or holds the row
-	 * at position aggregatedupto.	We advance aggregatedupto after processing
+	 * at position aggregatedupto.  We advance aggregatedupto after processing
 	 * a row.
 	 */
-	for (;;)
+	if(winstate->numindex != 0)
 	{
-		/* Fetch next row if we didn't already */
-		if (TupIsNull(agg_row_slot))
+		while(winstate->numindex > 0 && winstate->samindex[winstate->indexheadpos%samsize] < winstate->frameheadpos)
 		{
-			if (!window_gettupleslot(agg_winobj, winstate->aggregatedupto,
-									 agg_row_slot))
-				break;			/* must be end of partition */
+			++(winstate->indexheadpos);
+			--(winstate->numindex);
 		}
 
-		/* Exit loop (for now) if not in frame */
-		if (!row_is_in_frame(winstate, winstate->aggregatedupto, agg_row_slot))
-			break;
+		if(winstate->indexheadpos > samsize)
+			winstate->indexheadpos = winstate->indexheadpos % samsize;
 
-		/* Set tuple context for evaluation of aggregate arguments */
-		winstate->tmpcontext->ecxt_outertuple = agg_row_slot;
-
-		/* Accumulate row into the aggregates */
-		for (i = 0; i < numaggs; i++)
+		int cnt = 0;
+		bool isNew = false;
+		for (;;)
 		{
-			peraggstate = &winstate->peragg[i];
+			if(!isNew && cnt < winstate->numindex)
+			{
+				winstate->aggregatedupto = winstate->samindex[(winstate->indexheadpos+cnt)%samsize];
+				/* Fetch next row if we didn't already */
+				if (TupIsNull(agg_row_slot))
+				{
+					if (!window_gettupleslot(agg_winobj, winstate->aggregatedupto,
+											 agg_row_slot))
+						break;			/* must be end of partition */
+				}
 
-			/* Non-restarted aggs skip until aggregatedupto_nonrestarted */
-			if (!peraggstate->restart &&
-				winstate->aggregatedupto < aggregatedupto_nonrestarted)
-				continue;
+				/* Exit loop (for now) if not in frame */
+				if (!row_is_in_frame(winstate, winstate->aggregatedupto, agg_row_slot))
+					break;
 
-			wfuncno = peraggstate->wfuncno;
-			advance_windowaggregate(winstate,
-									&winstate->perfunc[wfuncno],
-									peraggstate);
+				/* Set tuple context for evaluation of aggregate arguments */
+				winstate->tmpcontext->ecxt_outertuple = agg_row_slot;
+
+				/* Accumulate row into the aggregates */
+				for (i = 0; i < numaggs; i++)
+				{
+					peraggstate = &winstate->peragg[i];
+
+					/* Non-restarted aggs skip until aggregatedupto_nonrestarted */
+					if (!peraggstate->restart &&
+						winstate->aggregatedupto < aggregatedupto_nonrestarted)
+						continue;
+
+					wfuncno = peraggstate->wfuncno;
+					advance_windowaggregate(winstate,
+											&winstate->perfunc[wfuncno],
+											peraggstate);
+				}
+
+				/* Reset per-input-tuple context after each tuple */
+				ResetExprContext(winstate->tmpcontext);
+
+				/* And advance the aggregated-row state */
+				winstate->aggregatedupto++;
+				ExecClearTuple(agg_row_slot);
+				++cnt;
+			}
+			else
+			{
+				/* we meet new tuple here, we set the aggregatedupto to where sample begins and isNew=true */
+				if(!isNew){
+					winstate->aggregatedupto = winstate->preframetailpos + 1;
+					isNew = true;
+				}
+				/* Fetch next row if we didn't already */
+				if (TupIsNull(agg_row_slot))
+				{
+					if (!window_gettupleslot(agg_winobj, winstate->aggregatedupto,
+											 agg_row_slot))
+						break;			/* must be end of partition */
+				}
+
+				/* Exit loop (for now) if not in frame */
+				if (!row_is_in_frame(winstate, winstate->aggregatedupto, agg_row_slot))
+					break;
+
+				if(drand48() < winstate->pp)
+				{
+					/* if window size is not enough for sample index, we double it. */
+					if(winstate->numindex>samsize-1){
+						int64* tempindex = winstate->samindex;
+						winstate->samindex = palloc0(sizeof(int64) * samsize*2);
+						memcpy(winstate->samindex,tempindex+winstate->indexheadpos,(samsize-winstate->indexheadpos)*sizeof(int64));
+						memcpy(winstate->samindex+samsize-winstate->indexheadpos,tempindex,winstate->indexheadpos*sizeof(int64));
+						samsize *= 2;
+						winstate->indexheadpos = 0;
+						pfree(tempindex);
+					}
+
+					winstate->samindex[(winstate->indexheadpos+winstate->numindex)%samsize] = winstate->aggregatedupto;
+					++(winstate->numindex);
+					/* Set tuple context for evaluation of aggregate arguments */
+					winstate->tmpcontext->ecxt_outertuple = agg_row_slot;
+
+					/* Accumulate row into the aggregates */
+					for (i = 0; i < numaggs; i++)
+					{
+						peraggstate = &winstate->peragg[i];
+
+						/* Non-restarted aggs skip until aggregatedupto_nonrestarted */
+						if (!peraggstate->restart &&
+							winstate->aggregatedupto < aggregatedupto_nonrestarted)
+							continue;
+
+
+						wfuncno = peraggstate->wfuncno;
+						advance_windowaggregate(winstate,
+												&winstate->perfunc[wfuncno],
+												peraggstate);
+					}
+
+					/* Reset per-input-tuple context after each tuple */
+					ResetExprContext(winstate->tmpcontext);
+				}
+				/* And advance the aggregated-row state */
+				winstate->aggregatedupto++;
+				ExecClearTuple(agg_row_slot);
+			}
 		}
-
-		/* Reset per-input-tuple context after each tuple */
-		ResetExprContext(winstate->tmpcontext);
-
-		/* And advance the aggregated-row state */
-		winstate->aggregatedupto++;
-		ExecClearTuple(agg_row_slot);
 	}
 
+	/* for the first tuple */
+	else
+	{
+		winstate->numindex = 0;
+		winstate->indexheadpos = 0;
+
+		for (;;)
+		{
+
+				/* Fetch next row if we didn't already */
+				if (TupIsNull(agg_row_slot))
+				{
+					if (!window_gettupleslot(agg_winobj, winstate->aggregatedupto,
+											 agg_row_slot))
+						break;			/* must be end of partition */
+				}
+
+				/* Exit loop (for now) if not in frame */
+				if (!row_is_in_frame(winstate, winstate->aggregatedupto, agg_row_slot))
+					break;
+
+				if(drand48() < winstate->pp)
+				{
+					//if window size is not enough for sample index, we double it.
+					if(winstate->numindex>samsize-1){
+						int64* tempindex = winstate->samindex;
+						winstate->samindex = palloc0(sizeof(int64) * samsize*2);
+						memcpy(winstate->samindex,tempindex,samsize*sizeof(int64));
+						samsize *= 2;
+						pfree(tempindex);
+					}
+
+					winstate->samindex[(winstate->indexheadpos+winstate->numindex)%samsize] = winstate->aggregatedupto;
+					++(winstate->numindex);
+					/* Set tuple context for evaluation of aggregate arguments */
+					winstate->tmpcontext->ecxt_outertuple = agg_row_slot;
+
+					/* Accumulate row into the aggregates */
+					for (i = 0; i < numaggs; i++)
+					{
+						peraggstate = &winstate->peragg[i];
+
+						/* Non-restarted aggs skip until aggregatedupto_nonrestarted */
+						if (!peraggstate->restart &&
+							winstate->aggregatedupto < aggregatedupto_nonrestarted)
+							continue;
+
+						wfuncno = peraggstate->wfuncno;
+						advance_windowaggregate(winstate,
+												&winstate->perfunc[wfuncno],
+												peraggstate);
+					}
+
+					/* Reset per-input-tuple context after each tuple */
+					ResetExprContext(winstate->tmpcontext);
+				}
+				/* And advance the aggregated-row state */
+				winstate->aggregatedupto++;
+				ExecClearTuple(agg_row_slot);
+
+		}
+	}
 	/* The frame's end is not supposed to move backwards, ever */
-	/*
-	 * In GPDB, though, it's entirely possible, if the START or END offset is
-	 * not a constant.
-	 */
-	Assert(frame_head_moved_backwards ||
-		   frame_tail_moved_backwards ||
-		   aggregatedupto_nonrestarted <= winstate->aggregatedupto);
+	Assert(aggregatedupto_nonrestarted <= winstate->aggregatedupto);
 
 	/*
 	 * finalize aggregates and fill result/isnull fields.
